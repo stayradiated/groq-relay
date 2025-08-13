@@ -24,6 +24,9 @@ jobs:
         with:
           run_install: false
 
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       - name: Deploy to production
         uses: cloudflare/wrangler-action@v3
         with:
