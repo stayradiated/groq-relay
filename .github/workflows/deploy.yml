@@ -3,8 +3,6 @@ name: Deploy Cloudflare Worker
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
 
 concurrency:
   group: deploy-${{ github.ref }}
@@ -12,41 +10,17 @@ concurrency:
 
 jobs:
   deploy-prod:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+
       - name: Deploy to production
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
-          # Create/update Worker secrets at deploy:
-          secrets: |
-            GROQ_API_KEY
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-
-  deploy-preview:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-    env:
-      WORKER_BASE: groq-relay
-    steps:
-      - uses: actions/checkout@v4
-      - name: Deploy PR preview (unique name per PR)
-        id: deploy
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy --name ${{ env.WORKER_BASE }}-pr-${{ github.event.number }}
           secrets: |
             GROQ_API_KEY
         env:
