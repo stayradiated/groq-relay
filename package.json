@@ -1,0 +1,19 @@
+{
+  "name": "groq-relay",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./src/worker.ts",
+  "scripts": {
+    "tidy": "biome check --write --unsafe .",
+    "check": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "George Czabania",
+  "license": "MIT",
+  "packageManager": "pnpm@10.13.1",
+  "devDependencies": {
+    "@biomejs/biome": "2.1.4",
+    "typescript": "5.9.2",
+    "wrangler": "4.29.1"
+  }
+}
