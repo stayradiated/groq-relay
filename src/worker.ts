@@ -36,13 +36,30 @@ function pickOrigin(req: Request, env: Env): string {
   return '*'
 }
 
-function withCORS(res: Response, origin: string) {
-  const h = new Headers(res.headers)
+function buildCorsHeaders(req: Request, origin: string) {
+  const reqMethod = req.headers.get('Access-Control-Request-Method') ?? 'POST'
+  const reqHeaders =
+    req.headers.get('Access-Control-Request-Headers') ??
+    'content-type,authorization'
+
+  const h = new Headers()
   h.set('Access-Control-Allow-Origin', origin)
-  h.set('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-  h.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+  h.set('Access-Control-Allow-Methods', reqMethod) // or "GET, POST, OPTIONS"
+  h.set('Access-Control-Allow-Headers', reqHeaders)
+  h.set('Access-Control-Max-Age', '86400')
   if (origin !== '*') {
     h.append('Vary', 'Origin')
+  }
+  // Make preflight cache vary by requested method/headers too:
+  h.append('Vary', 'Access-Control-Request-Method')
+  h.append('Vary', 'Access-Control-Request-Headers')
+  return h
+}
+
+function withCORS(res: Response, cors: Headers) {
+  const h = new Headers(res.headers)
+  for (const [k, v] of cors) {
+    h.set(k, v)
   }
   return new Response(res.body, { status: res.status, headers: h })
 }
@@ -63,6 +80,7 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const origin = pickOrigin(req, env)
     const url = new URL(req.url)
+    const cors = buildCorsHeaders(req, origin)
 
     // Health and preflight
     if (url.pathname === '/health') {
@@ -70,16 +88,18 @@ export default {
         new Response(JSON.stringify({ ok: true }), {
           headers: { 'Content-Type': 'application/json' },
         }),
-        origin,
+        cors,
       )
     }
+
     if (req.method === 'OPTIONS') {
-      return withCORS(new Response(null, { status: 204 }), origin)
+      // Preflight: return 204 with *only* headers
+      return new Response(null, { status: 204, headers: cors })
     }
 
     // Path allowlist
     if (!allowedPath(url.pathname, env)) {
-      return withCORS(new Response('Not found', { status: 404 }), origin)
+      return withCORS(new Response('Not found', { status: 404 }), cors)
     }
 
     // Build upstream URL (mirror path & query)
@@ -109,7 +129,7 @@ export default {
               status: 400,
               headers: { 'Content-Type': 'application/json' },
             }),
-            origin,
+            cors,
           )
         }
 
@@ -137,7 +157,7 @@ export default {
                   headers: { 'Content-Type': 'application/json' },
                 },
               ),
-              origin,
+              cors,
             )
           }
         }
@@ -163,6 +183,6 @@ export default {
       status: upstreamRes.status,
       headers: resHeaders,
     })
-    return withCORS(proxied, origin)
+    return withCORS(proxied, cors)
   },
 }

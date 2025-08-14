@@ -3,6 +3,6 @@ main = "src/worker.ts"
 compatibility_date = "2025-08-13"
 
 [vars]
-ALLOWED_MODELS = "llama-3.1-8b-instant"
+ALLOWED_MODELS = "openai/gpt-oss-20b,llama-3.1-8b-instant"
 ALLOW_PATHS = "/openai/v1/chat/completions,/openai/v1/models"
-CORS_ORIGINS = "george.czabania.com"
+CORS_ORIGINS = "https://george.czabania.com,http://localhost:4321"
