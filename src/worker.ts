@@ -1,138 +1,168 @@
 export interface Env {
-  GROQ_API_KEY: string;
+  // required
+  GROQ_API_KEY: string
+
+  // allow a comma-separated list of models (e.g. "llama-3.1-8b-instant,llama-3.1-70b-versatile")
+  ALLOW_MODELS?: string
+
+  // comma-separated path prefixes allowed to proxy (default below)
+  // example: "/openai/v1/chat/completions,/openai/v1/models"
+  ALLOW_PATHS?: string
+
+  // optional CORS
+  CORS_ORIGINS?: string // CSV allowlist; if provided we echo the request's Origin when it matches
 }
 
-// set to your blog’s origin for CORS, e.g. "https://yourblog.com"
-const CORS_ORIGIN = "https://george.czabania.com";
+const UPSTREAM_ORIGIN = 'https://api.groq.com'
 
-interface RequestBody {
-  system?: string;
-  user: string;
-  model?: string;
-  temperature?: number;
-  max_tokens?: number;
-  top_p?: number;
-  stop?: string;
+const csv = (s?: string) =>
+  (s ?? '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean)
+
+function pickOrigin(req: Request, env: Env): string {
+  const fromList = csv(env.CORS_ORIGINS)
+  const reqOrigin = req.headers.get('Origin')
+  if (fromList.length) {
+    if (reqOrigin && fromList.includes(reqOrigin)) {
+      return reqOrigin
+    }
+    const origin = fromList[0]
+    if (origin) {
+      return origin
+    }
+  }
+  return '*'
 }
 
-function json(data: unknown, status = 200, extra: Record<string, string> = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      ...extra,
-    },
-  });
+function withCORS(res: Response, origin: string) {
+  const h = new Headers(res.headers)
+  h.set('Access-Control-Allow-Origin', origin)
+  h.set('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  h.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+  if (origin !== '*') {
+    h.append('Vary', 'Origin')
+  }
+  return new Response(res.body, { status: res.status, headers: h })
 }
 
-function corsPreflight() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Max-Age": "86400",
-    },
-  });
+function allowedPath(pathname: string, env: Env) {
+  const defaults = [
+    '/openai/v1/chat/completions',
+    '/openai/v1/responses',
+    '/openai/v1/embeddings',
+    '/openai/v1/models',
+  ]
+  const allow = csv(env.ALLOW_PATHS)
+  const list = allow.length ? allow : defaults
+  return list.some((p) => pathname === p || pathname.startsWith(p))
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const origin = pickOrigin(req, env)
+    const url = new URL(req.url)
 
-    if (request.method === "OPTIONS") {
-      return corsPreflight();
+    // Health and preflight
+    if (url.pathname === '/health') {
+      return withCORS(
+        new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        }),
+        origin,
+      )
+    }
+    if (req.method === 'OPTIONS') {
+      return withCORS(new Response(null, { status: 204 }), origin)
     }
 
-    if (url.pathname === "/health") {
-      return json({ ok: true });
+    // Path allowlist
+    if (!allowedPath(url.pathname, env)) {
+      return withCORS(new Response('Not found', { status: 404 }), origin)
     }
 
-    if (url.pathname !== "/chat") {
-      return new Response("Not found", { status: 404 });
+    // Build upstream URL (mirror path & query)
+    const upstream = new URL(url.pathname + url.search, UPSTREAM_ORIGIN)
+
+    // Clone headers & inject secret
+    const headers = new Headers(req.headers)
+    headers.set('Authorization', `Bearer ${env.GROQ_API_KEY}`)
+    headers.set(
+      'Content-Type',
+      headers.get('Content-Type') || 'application/json',
+    )
+    headers.delete('Host') // will be set by fetch()
+
+    // Prepare body: only inspect JSON POSTs to enforce model/limits
+    let body: BodyInit | null = null
+    if (req.method === 'POST') {
+      const ct = headers.get('Content-Type') || ''
+      if (ct.includes('application/json')) {
+        const raw = await req.text()
+        let json: unknown
+        try {
+          json = raw ? JSON.parse(raw) : {}
+        } catch {
+          return withCORS(
+            new Response(JSON.stringify({ error: 'Invalid JSON' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            }),
+            origin,
+          )
+        }
+
+        // Model enforcement
+        const allowedModels = csv(env.ALLOW_MODELS)
+        const requested = (
+          typeof json === 'object' &&
+          json !== null &&
+          'model' in json &&
+          typeof json.model === 'string'
+            ? json.model
+            : ''
+        ).trim()
+
+        if (allowedModels.length) {
+          if (!requested || !allowedModels.includes(requested)) {
+            return withCORS(
+              new Response(
+                JSON.stringify({
+                  error: 'Model not allowed',
+                  allowed: allowedModels,
+                }),
+                {
+                  status: 403,
+                  headers: { 'Content-Type': 'application/json' },
+                },
+              ),
+              origin,
+            )
+          }
+        }
+
+        body = JSON.stringify(json)
+      } else {
+        // Non-JSON (e.g. multipart for audio) — forward raw
+        body = req.body
+      }
     }
 
-    if (request.method !== "POST") {
-      return new Response("Method Not Allowed", { status: 405 });
-    }
+    // Proxy the request
+    const upstreamRes = await fetch(upstream.toString(), {
+      method: req.method,
+      headers,
+      body: req.method === 'GET' || req.method === 'HEAD' ? null : body,
+    })
 
-    let body: RequestBody;
-    try {
-      body = await request.json();
-    } catch {
-      return json({ error: "Invalid JSON" }, 400);
-    }
-
-    const {
-      system = "You are a helpful assistant.",
-      user,
-      model = "llama-3.1-8b-instant",
-      temperature = 1,
-      max_tokens = 1024, // your client can pass this; we’ll map below
-      top_p = 1,
-      stop, // optional
-    } = body ?? {};
-
-    if (!user || typeof user !== "string") {
-      return json({ error: "Missing 'user' (string) in body" }, 400);
-    }
-
-    // Build OpenAI-compatible payload for Groq
-    const payload: Record<string, unknown> = {
-      model,
-      temperature,
-      top_p,
-      stream: true,
-      // Groq supports max_completion_tokens (keep to match your current code)
-      max_completion_tokens: max_tokens,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-    };
-    if (stop != null) payload.stop = stop;
-
-    const groqRes = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.GROQ_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      },
-    );
-
-    // Bubble up non-OK errors in JSON so your client can show them nicely
-    if (!groqRes.ok || !groqRes.body) {
-      let details = "";
-      try {
-        details = await groqRes.text();
-      } catch {}
-      return json(
-        {
-          error: "Upstream Groq error",
-          status: groqRes.status,
-          details: details?.slice(0, 2000),
-        },
-        groqRes.status,
-      );
-    }
-
-    // Stream the SSE straight through
-    const headers = new Headers();
-    headers.set("Content-Type", "text/event-stream");
-    headers.set("Cache-Control", "no-cache");
-    headers.set("Connection", "keep-alive");
-    headers.set("Access-Control-Allow-Origin", CORS_ORIGIN);
-    headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-
-    return new Response(groqRes.body, { status: 200, headers });
+    // Pass streaming bodies through unchanged (SSE, etc.)
+    const resHeaders = new Headers(upstreamRes.headers)
+    // add/override CORS
+    const proxied = new Response(upstreamRes.body, {
+      status: upstreamRes.status,
+      headers: resHeaders,
+    })
+    return withCORS(proxied, origin)
   },
-};
+}
